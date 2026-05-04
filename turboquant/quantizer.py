@@ -98,71 +98,96 @@ class TurboQuantMSE(nn.Module):
 class TurboQuantProd(nn.Module):
     """
     Two-stage inner product quantizer (MSE quantizer at bits-1, QJL on residual).
-    Included for vector search applicability. For KV Cache, use TurboQuantMSE.
+
+    Storage per vector: (bits-1) * dim bits (MSE) + m bits (QJL signs) + 16 bits (norms)
+    Inner product estimator is unbiased in expectation:
+        <y, x> ≈ <y, x_mse> + sqrt(pi/2)/m * res_norm * <y @ S.T, signs(S residual)>
+
+    The sqrt(pi/2)/m factor comes from E[|N(0,1)|] = sqrt(2/pi); without it the
+    estimator is biased by a constant factor.
     """
-    def __init__(self, dim: int, bits: int):
+    def __init__(self, dim: int, bits: int, m: Optional[int] = None):
         super().__init__()
         self.dim = dim
         self.bits = bits
+        # m = QJL projection dimension. Defaults to dim (paper recommendation).
+        self.m = m if m is not None else dim
         assert bits >= 2, "TurboQuantProd requires at least 2 bits"
-        
+
         # Stage 1: MSE Quantizer with (bits - 1)
         self.mse_quantizer = TurboQuantMSE(dim, bits - 1)
-        
-        # Stage 2: QJL random projection matrix
-        # S ~ N(0, 1) matrix of shape (dim, dim)
-        qjl_mat = torch.randn(dim, dim)
+
+        # Stage 2: QJL random projection matrix S of shape (m, dim), entries iid N(0, 1)
+        qjl_mat = torch.randn(self.m, dim)
         self.register_buffer("qjl_matrix", qjl_mat)
-        
+
     def quantize(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
         Quantizes using 2 stages.
         Returns:
             packed_mse_indices: (..., packed_dim)
             mse_norms: (..., 1)
-            packed_qjl_signs: (..., packed_dim_qjl) [1-bit packing]
+            packed_qjl_signs: (..., ceil(m/8))     [1-bit packing of m signs]
             residual_norms: (..., 1)
         """
         # Stage 1
         packed_mse, norms = self.mse_quantizer.quantize(x)
         x_hat_mse = self.mse_quantizer.dequantize(packed_mse, norms)
-        
+
         # Residual
         residual = x - x_hat_mse
         res_norms = torch.linalg.vector_norm(residual, dim=-1, keepdim=True)
-        
-        # Stage 2: QJL
-        # qjl_out = sign(S @ residual)
-        # residual: (..., dim), S: (dim, dim)
-        s_res = torch.matmul(residual, self.qjl_matrix.T)
-        signs = torch.sign(s_res)
-        
-        # Convert signs {-1, 1, 0} to binary {0, 1}
-        # 0 maps to 0 for simplicity, 1 to 1, -1 to 0
-        binary_signs = (signs > 0).to(torch.int8)
-        
-        # Pack to 1 bit
+
+        # Stage 2: QJL — project residual through S, take signs
+        # residual: (..., dim), S: (m, dim) → s_res: (..., m)
+        s_res = torch.matmul(residual, self.qjl_matrix.T.to(x.dtype))
+        # Map sign(s_res) ∈ {-1, +1} (zeros → +1 to disambiguate)
+        binary_signs = (s_res >= 0).to(torch.int8)
+
+        # Pack to 1 bit per element along last dim
         packed_qjl = pack_bits(binary_signs, 1)
-        
+
         return packed_mse, norms, packed_qjl, res_norms
-        
-    def dequantize(self, packed_mse: torch.Tensor, norms: torch.Tensor, 
+
+    def dequantize(self, packed_mse: torch.Tensor, norms: torch.Tensor,
                    packed_qjl: torch.Tensor, res_norms: torch.Tensor) -> torch.Tensor:
         """
-        Dequantizes standard MSE representation and adds QJL residual.
+        Reconstructs an estimate x_hat = x_mse + (sqrt(pi/2)/m) * res_norm * (signs @ S).
+        For inner-product use: <y, x_hat> is an unbiased estimator of <y, x>.
         """
         # Stage 1
         x_hat_mse = self.mse_quantizer.dequantize(packed_mse, norms)
-        
-        # Stage 2
-        binary_signs = unpack_bits(packed_qjl, 1, original_last_dim=self.dim)
-        # Map {0, 1} back to {-1, 1}
-        signs = binary_signs * 2.0 - 1.0
-        
-        # Dequantize QJL
-        # x_qjl = sqrt(pi/2) / d * res_norm * (S.T @ signs)
-        s_t_signs = torch.matmul(signs, self.qjl_matrix)
-        c = math.sqrt(math.pi / 2.0) / self.dim
+
+        # Stage 2: unpack signs ∈ {0, 1} → {-1, +1}
+        binary_signs = unpack_bits(packed_qjl, 1, original_last_dim=self.m)
+        signs = binary_signs.to(norms.dtype) * 2.0 - 1.0
+
+        # x_hat_qjl = sqrt(pi/2) / m * res_norm * (signs @ S)
+        # signs: (..., m), S: (m, dim) → (..., dim)
+        s_t_signs = torch.matmul(signs, self.qjl_matrix.to(norms.dtype))
+        c = math.sqrt(math.pi / 2.0) / self.m
         x_hat_qjl = c * res_norms * s_t_signs
-        
+
         return x_hat_mse + x_hat_qjl
+
+    def estimate_inner_product(self, y: torch.Tensor, packed_mse: torch.Tensor,
+                                norms: torch.Tensor, packed_qjl: torch.Tensor,
+                                res_norms: torch.Tensor) -> torch.Tensor:
+        """
+        Direct (algebraically equivalent) two-term unbiased estimator of <y, x>:
+            term1 = <y, x_mse>
+            term2 = sqrt(pi/2)/m * res_norm * <y @ S.T, signs>
+        Useful in attention: avoids materializing x_hat in dim-d space.
+        """
+        x_hat_mse = self.mse_quantizer.dequantize(packed_mse, norms)
+        term1 = (y * x_hat_mse).sum(dim=-1, keepdim=True)
+
+        binary_signs = unpack_bits(packed_qjl, 1, original_last_dim=self.m)
+        signs = binary_signs.to(y.dtype) * 2.0 - 1.0
+
+        y_proj = torch.matmul(y, self.qjl_matrix.T.to(y.dtype))
+        qjl_ip = (y_proj * signs).sum(dim=-1, keepdim=True)
+        c = math.sqrt(math.pi / 2.0) / self.m
+        term2 = c * res_norms * qjl_ip
+
+        return (term1 + term2).squeeze(-1)
